@@ -1,0 +1,16 @@
+# Credentials / local configuration
+.env
+*.key
+*.pem
+
+# Temporary files
+*.tmp
+*.swp
+*~
+
+# Logs
+*.log
+
+# OS/editor files
+.DS_Store
+.vscode/
