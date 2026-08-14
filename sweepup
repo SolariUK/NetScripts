@@ -1,6 +1,6 @@
 #!/bin/bash
 #
-# Sweep devices for uptime.
+# Sweep devices for uptime to look for reboots or general uptime audit.
 # v2.2 - Unified DHMS formatting (via -Ot), SNMPCMD as array, clearer SNMP error highlighting
 #
 # use -f to specify input file of specific hostnames/FQDNs or IPs to poll
