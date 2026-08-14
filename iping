@@ -1,0 +1,447 @@
+#!/usr/bin/env bash
+#
+# iping - Simple long-running ping monitor
+#
+# Intended for monitoring hosts suspected of intermittent packet loss or
+# latency issues. By default, runs until interrupted with Ctrl+C and prints
+# a summary on exit.
+#
+# Usage:
+#   iping [options] HOST
+#
+# Options:
+#   -4              Force IPv4
+#   -6              Force IPv6
+#   -c COUNT        Stop after COUNT probes (default: run indefinitely)
+#   -i SECONDS      Interval between probes (default: 1)
+#   -W SECONDS      Ping reply timeout (default: 1)
+#   -o FILE         Log failures/events to FILE
+#   -q              Quiet mode; don't print successful probes
+#   -n              Numeric ping output; don't resolve addresses
+#   -h              Show help
+#
+# Examples:
+#   iping router.example.com
+#   iping -c 100 192.0.2.1
+#   iping -i 5 -W 2 router.example.com
+#   iping -q -o flaky.log router.example.com
+#   iping -6 2001:db8::1
+#
+# Exit status:
+#   0   Monitoring completed normally
+#   1   Invalid arguments or setup failure
+#   130 Interrupted with Ctrl+C
+#
+
+set -u
+set -o pipefail
+
+PROGRAM=${0##*/}
+
+INTERVAL=1
+TIMEOUT=1
+COUNT=0
+QUIET=0
+NUMERIC=0
+IP_VERSION=""
+OUTPUT_FILE=""
+
+TOTAL=0
+RECEIVED=0
+LOST=0
+CONSECUTIVE_LOSS=0
+MAX_CONSECUTIVE_LOSS=0
+
+LATLOG=""
+START_TIME=$(date +%s)
+
+# Colours are only enabled when stdout is a terminal.
+if [[ -t 1 ]]; then
+    RED=$'\033[1;31m'
+    GREEN=$'\033[1;32m'
+    YELLOW=$'\033[1;33m'
+    RESET=$'\033[0m'
+else
+    RED=""
+    GREEN=""
+    YELLOW=""
+    RESET=""
+fi
+
+
+usage() {
+    cat <<EOF
+Usage: $PROGRAM [options] HOST
+
+Monitor a host for intermittent packet loss and latency.
+
+Options:
+  -4              Force IPv4
+  -6              Force IPv6
+  -c COUNT        Stop after COUNT probes
+  -i SECONDS      Interval between probes (default: $INTERVAL)
+  -W SECONDS      Reply timeout (default: $TIMEOUT)
+  -o FILE         Log failures/events to FILE
+  -q              Quiet mode; don't print successful probes
+  -n              Use numeric ping output
+  -h              Show this help
+
+Examples:
+  $PROGRAM router.example.com
+  $PROGRAM -c 100 192.0.2.1
+  $PROGRAM -i 5 -W 2 router.example.com
+  $PROGRAM -q -o flaky.log router.example.com
+  $PROGRAM -6 2001:db8::1
+EOF
+}
+
+
+die() {
+    printf '%s: %s\n' "$PROGRAM" "$*" >&2
+    exit 1
+}
+
+
+timestamp() {
+    date '+%Y/%m/%d %H:%M:%S'
+}
+
+
+cleanup() {
+    if [[ -n "$LATLOG" && -e "$LATLOG" ]]; then
+        rm -f -- "$LATLOG"
+    fi
+}
+
+
+summary() {
+    local end_time duration loss_pct
+
+    end_time=$(date +%s)
+    duration=$((end_time - START_TIME))
+
+    printf '\n'
+    printf '%s\n' "--- $host ping statistics ---"
+
+    if (( TOTAL > 0 )); then
+        loss_pct=$(awk -v lost="$LOST" -v total="$TOTAL" \
+            'BEGIN { printf "%.2f", (lost / total) * 100 }')
+    else
+        loss_pct="0.00"
+    fi
+
+    printf '%d probes transmitted, %d received, %d lost (%s%% loss)\n' \
+        "$TOTAL" "$RECEIVED" "$LOST" "$loss_pct"
+
+    printf 'Longest consecutive loss: %d probe(s)\n' \
+        "$MAX_CONSECUTIVE_LOSS"
+
+    if [[ -n "$LATLOG" && -s "$LATLOG" ]]; then
+        awk '
+            NR == 1 {
+                min = max = $1
+            }
+
+            {
+                sum += $1
+
+                if ($1 < min)
+                    min = $1
+
+                if ($1 > max)
+                    max = $1
+            }
+
+            END {
+                if (NR > 0) {
+                    printf "rtt min/avg/max = %.3f/%.3f/%.3f ms\n",
+                           min, sum / NR, max
+                }
+            }
+        ' "$LATLOG"
+    else
+        printf 'rtt min/avg/max = no successful replies\n'
+    fi
+
+    printf 'Monitoring duration: %d seconds\n' "$duration"
+
+    if [[ -n "$OUTPUT_FILE" ]]; then
+        printf 'Failure log: %s\n' "$OUTPUT_FILE"
+    fi
+}
+
+
+handle_interrupt() {
+    summary
+    exit 130
+}
+
+
+handle_term() {
+    summary
+    exit 143
+}
+
+
+# Always remove temporary files.
+trap cleanup EXIT
+
+# Produce a useful summary if monitoring is interrupted.
+trap handle_interrupt INT
+trap handle_term TERM HUP
+
+
+#
+# Command-line options
+#
+
+while getopts ':46c:i:W:o:qnh' opt; do
+    case "$opt" in
+        4)
+            [[ "$IP_VERSION" != "-6" ]] ||
+                die '-4 and -6 cannot be used together'
+            IP_VERSION="-4"
+            ;;
+
+        6)
+            [[ "$IP_VERSION" != "-4" ]] ||
+                die '-4 and -6 cannot be used together'
+            IP_VERSION="-6"
+            ;;
+
+        c)
+            [[ "$OPTARG" =~ ^[1-9][0-9]*$ ]] ||
+                die '-c requires a positive integer'
+            COUNT=$OPTARG
+            ;;
+
+        i)
+            [[ "$OPTARG" =~ ^[0-9]+([.][0-9]+)?$ ]] ||
+                die '-i requires a non-negative number'
+            INTERVAL=$OPTARG
+            ;;
+
+        W)
+            [[ "$OPTARG" =~ ^[0-9]+([.][0-9]+)?$ ]] ||
+                die '-W requires a non-negative number'
+            TIMEOUT=$OPTARG
+            ;;
+
+        o)
+            OUTPUT_FILE=$OPTARG
+            ;;
+
+        q)
+            QUIET=1
+            ;;
+
+        n)
+            NUMERIC=1
+            ;;
+
+        h)
+            usage
+            exit 0
+            ;;
+
+        :)
+            die "option -$OPTARG requires an argument"
+            ;;
+
+        \?)
+            die "unknown option: -$OPTARG"
+            ;;
+    esac
+done
+
+shift $((OPTIND - 1))
+
+
+#
+# Validate arguments
+#
+
+(( $# == 1 )) || {
+    usage >&2
+    exit 1
+}
+
+host=$1
+
+
+#
+# Check dependencies
+#
+
+command -v ping >/dev/null 2>&1 ||
+    die "'ping' command not found"
+
+command -v awk >/dev/null 2>&1 ||
+    die "'awk' command not found"
+
+command -v mktemp >/dev/null 2>&1 ||
+    die "'mktemp' command not found"
+
+
+#
+# Create temporary latency log.
+#
+
+LATLOG=$(mktemp "${TMPDIR:-/tmp}/iping_latencies.XXXXXX") ||
+    die 'unable to create temporary latency log'
+
+
+#
+# Build ping arguments.
+#
+
+PING_ARGS=()
+
+if [[ -n "$IP_VERSION" ]]; then
+    PING_ARGS+=("$IP_VERSION")
+fi
+
+if (( NUMERIC )); then
+    PING_ARGS+=("-n")
+fi
+
+PING_ARGS+=(
+    "-W" "$TIMEOUT"
+    "-c" "1"
+)
+
+
+#
+# Validate output file if requested.
+#
+
+if [[ -n "$OUTPUT_FILE" ]]; then
+    if ! touch -- "$OUTPUT_FILE" 2>/dev/null; then
+        die "cannot write to output file: $OUTPUT_FILE"
+    fi
+fi
+
+
+#
+# Initial host check.
+#
+# We deliberately let ping handle hostname/IP parsing rather than trying
+# to maintain our own IPv4/IPv6/hostname validation.
+#
+
+printf 'Monitoring %s' "$host"
+
+if [[ -n "$IP_VERSION" ]]; then
+    printf ' (%s)' "${IP_VERSION#-}"
+fi
+
+printf ' - interval %ss, timeout %ss' "$INTERVAL" "$TIMEOUT"
+
+if (( COUNT > 0 )); then
+    printf ', %d probes' "$COUNT"
+fi
+
+printf '\n'
+printf 'Press Ctrl+C to stop and display statistics.\n\n'
+
+
+#
+# Main monitoring loop
+#
+
+while :; do
+    ((TOTAL += 1))
+
+    result=""
+    ping_status=0
+
+    if result=$(ping "${PING_ARGS[@]}" -- "$host" 2>&1); then
+        ((RECEIVED += 1))
+
+        CONSECUTIVE_LOSS=0
+
+        #
+        # Extract RTT from the successful ping response.
+        #
+        # Typical iputils output:
+        #
+        #   64 bytes from 192.0.2.1:
+        #       icmp_seq=1 ttl=64 time=12.3 ms
+        #
+        rtt=$(awk '
+            match($0, /time[=<][[:space:]]*[0-9.]+/) {
+                value = substr($0, RSTART, RLENGTH)
+                sub(/^time[=<][[:space:]]*/, "", value)
+                print value
+                exit
+            }
+        ' <<< "$result")
+
+        if [[ -n "$rtt" ]]; then
+            printf '%s\n' "$rtt" >> "$LATLOG"
+        fi
+
+        if (( ! QUIET )); then
+            printf '%s - host %s is %sok%s' \
+                "$(timestamp)" "$host" "$GREEN" "$RESET"
+
+            if [[ -n "$rtt" ]]; then
+                printf ' - %.3f ms' "$rtt"
+            fi
+
+            printf '\n'
+        fi
+
+    else
+        ping_status=$?
+
+        ((LOST += 1))
+        ((CONSECUTIVE_LOSS += 1))
+
+        if (( CONSECUTIVE_LOSS > MAX_CONSECUTIVE_LOSS )); then
+            MAX_CONSECUTIVE_LOSS=$CONSECUTIVE_LOSS
+        fi
+
+        message=$(printf '%s - host %s is %sdown%s (ping exit %d)' \
+            "$(timestamp)" \
+            "$host" \
+            "$RED" \
+            "$RESET" \
+            "$ping_status")
+
+        printf '%s\n' "$message"
+
+        #
+        # Log the uncoloured version so log files don't contain
+        # terminal escape sequences.
+        #
+        if [[ -n "$OUTPUT_FILE" ]]; then
+            printf '%s - host %s is down (ping exit %d)\n' \
+                "$(timestamp)" \
+                "$host" \
+                "$ping_status" >> "$OUTPUT_FILE"
+
+            #
+            # Preserve ping's diagnostic output as it may explain
+            # failures such as "Destination Host Unreachable".
+            #
+            if [[ -n "$result" ]]; then
+                printf '%s\n' "$result" >> "$OUTPUT_FILE"
+            fi
+        fi
+    fi
+
+    #
+    # Stop after the requested number of probes.
+    #
+    if (( COUNT > 0 && TOTAL >= COUNT )); then
+        summary
+        exit 0
+    fi
+
+    #
+    # Keep the delay outside the success/failure branches so successful
+    # and unsuccessful probes are treated consistently.
+    #
+    sleep "$INTERVAL"
+done
