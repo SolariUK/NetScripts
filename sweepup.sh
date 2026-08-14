@@ -20,11 +20,11 @@ TIMEOUT=4		# 4 secs
 RETRIES=0		# No retries
 READSTR="public"	# v2c community
 FILE=/etc/hosts		# Default file to search for resolution
-V3USER="snmp-v3-ro-user"	# Default SNMPV3 User
+V3USER="snmp-v3-user"	# Default SNMPV3 User
 V3AUTH=SHA		# Default SNMPV3 Auth Mechanism
-SNMPAUTH="AaBbCc000"	# SNMPv3 Auth Password
+SNMPAUTH="V3AuthPW"	# SNMPv3 Auth Password
 V3PRIV=AES		# Default SNMPV3 Priv Mechanism
-SNMPPRIV="DdEeFf1111"	# SNMPv3 Priv Password
+SNMPPRIV="V3PrivPW"	# SNMPv3 Priv Password
 SNMPVER=2c		# Default version = 2c
 USEENGINE=1		# Use snmpEngineTime - sysUpTime wraps after 496 days
 STACKSTATEOID=1.3.6.1.4.1.9.9.500.1.2.1.1.6
