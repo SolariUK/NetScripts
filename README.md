@@ -13,16 +13,19 @@ Screenshots:
 
 ## sweepup
 
+```text
 Usage: ./sweepup {-v3} {-e} {-s} {-f filename} {-c community} {-l list of devices} {string}
+```
 
 ![sweepup](images/sweepup.png)
 
 
 ## iping
 
-Usage: iping [options] HOST
-
 Monitor a host for intermittent packet loss and latency.
+
+```text
+Usage: iping [options] HOST
 
 Options:
   -4              Force IPv4
@@ -41,12 +44,16 @@ Examples:
   iping -i 5 -W 2 router.example.com
   iping -q -o flaky.log router.example.com
   iping -6 2001:db8::1
+```
 
 ![iping](images/iping.png)
 
 
 ## tls-audit
 
+TLS Testing Tool.
+
+```text
 Usage:
   tls-audit [options] <hostname> [port]
 
@@ -75,7 +82,7 @@ Exit codes:
   1   Scan completed; audit issues detected
   2   Connection or TLS handshake failed
   3   Usage/local dependency error
-
+```
 
 ![iping](images/tls-audit0.png)
 ![iping](images/tls-audit.png)
