@@ -84,5 +84,8 @@ Exit codes:
   3   Usage/local dependency error
 ```
 
+Summary Mode:
 ![iping](images/tls-audit0.png)
+
+Normal Mode:
 ![iping](images/tls-audit.png)
