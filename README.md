@@ -3,13 +3,35 @@
 This is a selection of portable bash scripts used for network
 support/engineering purposes.
 
-- sweepup     Sweep uptime of devices + stack status if desired
-- iping       Continuous pinger for monitoring intermittent issues
-- tls-audit   TLS audit for supported ciphers on endpoints
+- fullportstatus    Quick status of all ports on a device
+- sweepup           Sweep uptime of devices + stack status if desired
+- iping             Continuous pinger for monitoring intermittent issues
+- tls-audit         TLS audit for supported ciphers on endpoints
 
 Use at your own risk etc etc, no liability accepted.
 
-Screenshots:
+## fullportstatus
+Usage: ./fullportstatus [options] devicename
+       ./fullportstatus [options] -h devicename
+
+Options:
+ -3          use SNMPv3 creds set in script
+ -l          use low-speed ifSpeed OID for older devices
+ -n          do not colourise
+ -f 'regex'  show only interfaces whose ifDescr matches regex
+ -h name     specify hostname
+
+The -f option accepts a POSIX awk extended regular expression.
+Quoting the expression is recommended to prevent shell expansion.
+
+Examples:
+  ./fullportstatus router1
+  ./fullportstatus -n router1
+  ./fullportstatus router1 -f '^GigabitEthernet'
+  ./fullportstatus -f '^ge-' router2
+  ./fullportstatus -f '^ge-[0-9]+/[0-9]+/[0-9]+$' router2
+
+![fullportstatus](images/fullportstatus.png)
 
 ## sweepup
 
