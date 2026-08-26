@@ -11,6 +11,8 @@ support/engineering purposes.
 Use at your own risk etc etc, no liability accepted.
 
 ## fullportstatus
+
+```text
 Usage: ./fullportstatus [options] devicename
        ./fullportstatus [options] -h devicename
 
@@ -30,6 +32,7 @@ Examples:
   ./fullportstatus router1 -f '^GigabitEthernet'
   ./fullportstatus -f '^ge-' router2
   ./fullportstatus -f '^ge-[0-9]+/[0-9]+/[0-9]+$' router2
+```
 
 ![fullportstatus](images/fullportstatus.png)
 
