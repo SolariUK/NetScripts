@@ -17,7 +17,7 @@ to make sure things look the same. Eg:
 
 ```text
 for host in 192.168.122.{2..3}; 
-do echo "=== $host ==="; ./fullportstatus -n $host ; done | tee port-audit-before.txt
+do echo "=== $host ==="; ./fullportstatus -n "$host" ; done | tee port-audit-before.txt
 ```
 
 Repeating the above with a port-audit-after.txt then lets you do:
