@@ -55,7 +55,26 @@ Examples:
 ## sweepup
 
 ```text
-Usage: ./sweepup {-v3} {-e} {-s} {-f filename} {-c community} {-l list of devices} {string}
+Usage: ./sweepup [options] -l target1 target2  ...
+       ./sweepup [options] search-string
+
+Options:
+ -v3                  Use SNMPv3 with credentials set in script
+ -c COMMUNITY         Override default SNMPv2C community string
+ -e                   Use sysUpTime instead of snmpEngineTime
+ -f FILENAME          Search device names from a hosts style file
+ -l device1 device2   Specify list of devices to sweep
+ -s                   Try to verify status of Cisco Stack members
+
+ If using IPs or FQDNs, specify with a list after -l
+ If wanting to just search within a hosts style file, use a string or regex
+
+Examples:
+  ./sweepup router[123]
+  ./sweepup -f /etc/hosts lon
+  ./sweepup -c READONLY -l router1.lab.local
+  ./sweepup -s -l 192.168.122.2 192.168.122.3
+  ./sweepup -l router{1..8}.lab.local
 ```
 
 ![sweepup](images/sweepup.png)
