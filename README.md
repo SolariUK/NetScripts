@@ -54,6 +54,8 @@ Examples:
 
 ## sweepup
 
+Sweep Uptime of multiple devices to check for reboots and reachability.
+
 ```text
 Usage: ./sweepup [options] -l target1 target2  ...
        ./sweepup [options] search-string
