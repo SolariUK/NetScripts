@@ -60,6 +60,9 @@ via DNS.
 
 Handy for when name resolution isn't configured on network kit.
 
+Just paste your traceroute output in, and hit ENTER twice - 2 x empty
+lines start resolving.
+
 ```text
 Usage: traceparse [options]
 
