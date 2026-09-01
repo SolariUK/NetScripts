@@ -3,9 +3,10 @@
 This is a selection of portable bash scripts used for network
 support/engineering purposes.
 
-- fullportstatus:    Quick status of all ports on a device
-- sweepup:           Sweep uptime of devices + stack status if desired
-- iping:             Continuous pinger for monitoring intermittent issues
+- fullportstatus:   Quick status of all ports on a device
+- traceparse        Resolve hops from Cisco/Juniper traceroute output via SNMP/DNS
+- sweepup:          Sweep uptime of devices + stack status if desired
+- iping:            Continuous pinger for monitoring intermittent issues
 - tls-audit:        TLS audit for supported ciphers on endpoints
 
 Use at your own risk etc etc, no liability accepted.
@@ -51,6 +52,35 @@ Examples:
 ```
 
 ![fullportstatus](images/fullportstatus.png)
+
+## traceparse
+
+Resolve hops in Cisco/Juniper traceroute output by snmp SysName.0 or
+via DNS.
+
+Handy for when name resolution isn't configured on network kit.
+
+```text
+Usage: traceparse [options]
+
+Options:
+    -m METHOD       Resolution method: snmp or dns
+                    Default: snmp
+
+    -c COMMUNITY    SNMP v2c community string
+                    Default: public
+
+    -s DNS_SERVER   DNS server to use for reverse lookups.
+                    Only valid with '-m dns'.
+
+    -h              Display this help.
+
+Examples:
+    traceparse
+    traceparse -m snmp -c public
+    traceparse -m dns
+    traceparse -m dns -s 192.0.2.53
+```
 
 ## sweepup
 

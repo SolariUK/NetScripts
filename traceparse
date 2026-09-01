@@ -1,0 +1,257 @@
+#!/usr/bin/env bash
+
+#
+# Resolve hops from Cisco/Juniper traceroute output.
+#
+# Handy when name resolution isn't configured on 
+# network kit.
+#
+# Resolution methods:
+#   snmp - Query sysName.0 using SNMPv2c
+#   dns  - Perform a reverse DNS lookup
+#
+
+set -u
+
+readonly SYSNAME_OID='.1.3.6.1.2.1.1.5.0'
+
+METHOD="snmp"
+COMMUNITY="public"
+DNS_SERVER=""
+
+
+usage() {
+    cat <<EOF
+Usage: $(basename "$0") [options]
+
+Options:
+    -m METHOD       Resolution method: snmp or dns
+                    Default: snmp
+
+    -c COMMUNITY    SNMP v2c community string
+                    Default: public
+
+    -s DNS_SERVER   DNS server to use for reverse lookups.
+                    Only valid with '-m dns'.
+
+    -h              Display this help.
+
+Examples:
+    $(basename "$0")
+    $(basename "$0") -m snmp -c public
+    $(basename "$0") -m dns
+    $(basename "$0") -m dns -s 192.0.2.53
+EOF
+}
+
+
+resolve_snmp() {
+    local ip="$1"
+    local name
+
+    name=$(
+        snmpget \
+            -t 2 \
+            -r 0 \
+            -v2c \
+            -c "$COMMUNITY" \
+            -Oqv \
+            "$ip" \
+            "$SYSNAME_OID" \
+            2>/dev/null
+    )
+
+    # Remove quotes returned by some versions of snmpget.
+    name="${name#\"}"
+    name="${name%\"}"
+
+    if [[ -n "$name" ]]; then
+        printf '%s' "$name"
+    else
+        printf '%s' "<no SNMP response>"
+    fi
+}
+
+
+resolve_dns() {
+    local ip="$1"
+    local name
+
+    if [[ -n "$DNS_SERVER" ]]; then
+
+        # Query the specified DNS server directly.
+        name=$(
+            dig \
+                +short \
+                -x "$ip" \
+                "@$DNS_SERVER" \
+                2>/dev/null |
+            head -n 1
+        )
+
+    else
+
+        # Use the host's normal name-service configuration.
+        name=$(
+            getent hosts "$ip" 2>/dev/null |
+            awk 'NR == 1 {print $2}'
+        )
+
+    fi
+
+    # PTR records returned by dig normally have a trailing dot.
+    name="${name%.}"
+
+    if [[ -n "$name" ]]; then
+        printf '%s' "$name"
+    else
+        printf '%s' "<unresolved>"
+    fi
+}
+
+
+resolve_hop() {
+    local ip="$1"
+
+    case "$METHOD" in
+        snmp)
+            resolve_snmp "$ip"
+            ;;
+        dns)
+            resolve_dns "$ip"
+            ;;
+    esac
+}
+
+
+#
+# Process command-line options.
+#
+
+while getopts ":m:c:s:h" opt; do
+    case "$opt" in
+        m)
+            METHOD="$OPTARG"
+            ;;
+        c)
+            COMMUNITY="$OPTARG"
+            ;;
+        s)
+            DNS_SERVER="$OPTARG"
+            ;;
+        h)
+            usage
+            exit 0
+            ;;
+        :)
+            printf 'Error: Option -%s requires an argument.\n\n' \
+                "$OPTARG" >&2
+            usage >&2
+            exit 1
+            ;;
+        \?)
+            printf 'Error: Unknown option -%s.\n\n' \
+                "$OPTARG" >&2
+            usage >&2
+            exit 1
+            ;;
+    esac
+done
+
+
+#
+# Validate options.
+#
+
+case "$METHOD" in
+    snmp|dns)
+        ;;
+    *)
+        printf 'Error: Unknown resolution method: %s\n' \
+            "$METHOD" >&2
+        exit 1
+        ;;
+esac
+
+if [[ "$METHOD" != "dns" && -n "$DNS_SERVER" ]]; then
+    printf 'Error: -s can only be used with "-m dns".\n' >&2
+    exit 1
+fi
+
+
+#
+# Collect traceroute input.
+#
+
+lines=()
+blank_count=0
+
+printf 'Paste the Cisco/Juniper traceroute output below.\n'
+printf 'Press Enter twice when finished.\n\n'
+
+while IFS= read -r line; do
+
+    # Treat an empty line, or one containing only whitespace, as blank.
+    if [[ "$line" =~ ^[[:space:]]*$ ]]; then
+
+        ((blank_count++))
+
+        if (( blank_count >= 2 )); then
+            break
+        fi
+
+        continue
+    fi
+
+    # A non-blank line resets the consecutive blank-line counter.
+    blank_count=0
+
+    lines+=("$line")
+
+done
+
+
+#
+# Resolve the hops.
+#
+
+printf '\nChecking...\n\n'
+
+for line in "${lines[@]}"; do
+
+    #
+    # Find the first IPv4 address on the line.
+    #
+    # We don't assume the address is field 2 because traceroute output
+    # can contain things such as:
+    #
+    #   7  *  1  172.17.15.2  2 msec  1 msec  1 msec
+    #
+
+    hop=$(
+        awk '{
+            for (i = 2; i <= NF; i++) {
+                if ($i ~ /^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$/) {
+                    print $i
+                    exit
+                }
+            }
+        }' <<< "$line"
+    )
+
+    #
+    # Ignore lines which don't contain an IPv4 address.
+    #
+    # This allows the complete traceroute output to be pasted,
+    # including headers and other informational lines.
+    #
+
+    if [[ -z "$hop" ]]; then
+        continue
+    fi
+
+    hopname=$(resolve_hop "$hop")
+
+    printf '%s - %s\n' "$line" "$hopname"
+
+done
