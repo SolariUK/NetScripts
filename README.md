@@ -2,7 +2,7 @@
 
 This is a selection of portable bash scripts used for network
 support/engineering purposes. These were originally written many moons
-Chatago but have been reviewed/refactored with GPT/Claude to fix some
+ago but have been reviewed/refactored with GPT/Claude to fix some
 bugs and to add new features which has saved my aging brain some work.
 
 - fullportstatus:   Quick status of all ports on a device
