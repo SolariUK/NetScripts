@@ -118,7 +118,11 @@ Examples:
 
 ## hwaudit
 
-Sweep devices for more detailed info, see screenshot below. Stacks can also be included.
+Sweep devices for more detailed info, see screenshot below. Stacks can also be
+included if desired to check stack members in ready state.
+
+Useful for checking after power/cabing/upgrade works to check versions and PSU/FAN
+statuses.
 
 See --help for full info. Filling out default strings in script will make life easier.
 
