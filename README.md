@@ -6,6 +6,7 @@ support/engineering purposes.
 - fullportstatus:   Quick status of all ports on a device
 - traceparse:       Resolve hops from Cisco/Juniper traceroute output via SNMP/DNS
 - sweepup:          Sweep uptime of devices + stack status if desired
+- hwaudit:          Sweep name, uptime, stack status, PSU/Fan Status, software version
 - iping:            Continuous pinger for monitoring intermittent issues
 - tls-audit:        TLS audit for supported ciphers on endpoints
 
@@ -114,6 +115,36 @@ Examples:
 
 ![sweepup](images/sweepup.png)
 
+
+## hwaudit
+
+Sweep devices for more detailed info, see screenshot below. Stacks can also be included.
+
+See --help for full info. Filling out default strings in script will make life easier.
+
+```text
+Examples:
+  hwaudit -c COMMUNITY \
+      --hosts host1.lab.local host2.lab.local
+
+  SNMP_COMMUNITY='COMMUNITY' \
+      hwaudit --host-file switches.txt
+
+  hwaudit -v 3 \
+      -u snmp-readonly \
+      -l authPriv \
+      -a SHA \
+      -A 'authentication-password' \
+      -x AES \
+      -X 'privacy-password' \
+      --hosts host1.lab.local
+
+  hwaudit -c COMMUNITY \
+      --no-color \
+      --host-file switches.txt > results.txt
+```
+
+![sweepup](images/hwaudit.png)
 
 ## iping
 

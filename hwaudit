@@ -1,0 +1,1453 @@
+#!/usr/bin/env bash
+#
+# cisco-snmp-inventory.sh
+#
+# Poll Cisco network devices for:
+#   sysName
+#   Serial number
+#   Uptime (snmpEngineTime with sysUpTime fallback)
+#   PSU status
+#   Fan status
+#   Software version
+#
+# Requirements:
+#   Bash 4+
+#   Net-SNMP snmpget, snmpgetnext and snmpwalk
+#
+# Exit codes:
+#   0  All requested targets completed successfully
+#   1  One or more targets failed
+#   2  Usage, configuration or dependency error
+#
+
+set -uo pipefail
+
+readonly PROGRAM_NAME="${0##*/}"
+
+###############################################################################
+# OIDs
+###############################################################################
+
+readonly OID_SYS_DESCR=".1.3.6.1.2.1.1.1.0"
+readonly OID_SYS_UPTIME=".1.3.6.1.2.1.1.3.0"
+readonly OID_SYS_NAME=".1.3.6.1.2.1.1.5.0"
+
+# SNMP-FRAMEWORK-MIB snmpEngineTime
+readonly OID_SNMP_ENGINE_TIME=".1.3.6.1.6.3.10.2.1.3.0"
+
+# Cisco chassis serial number
+readonly OID_CISCO_SERIAL=".1.3.6.1.4.1.9.3.6.3"
+readonly OID_ENT_PHYSICAL_CLASS=".1.3.6.1.2.1.47.1.1.1.1.5"
+readonly OID_ENT_PHYSICAL_SERIAL=".1.3.6.1.2.1.47.1.1.1.1.11"
+
+# ENTITY-MIB entPhysicalSerialNum
+readonly OID_ENTITY_SERIAL=".1.3.6.1.2.1.47.1.1.1.1.11"
+
+# CISCO-ENTITY-FRU-CONTROL-MIB
+readonly OID_CEFC_PSU_STATUS=".1.3.6.1.4.1.9.9.117.1.1.2.1.2"
+readonly OID_CEFC_FAN_STATUS=".1.3.6.1.4.1.9.9.117.1.4.1.1.1"
+
+# CISCO-ENVMON-MIB fallback for PSU status
+readonly OID_ENVMON_PSU_STATUS=".1.3.6.1.4.1.9.9.13.1.5.1.3"
+
+# CISCO-STACKWISE-MIB / stack member state
+readonly OID_STACK_MEMBER_STATE=".1.3.6.1.4.1.9.9.500.1.2.1.1.6"
+
+###############################################################################
+# Defaults
+###############################################################################
+
+SNMP_VERSION="2c"
+COMMUNITY="public"
+UPTIME_SOURCE="auto"
+
+V3_USER="${SNMPV3_USER:-}"
+V3_LEVEL="${SNMPV3_LEVEL:-authPriv}"
+V3_AUTH_PROTOCOL="${SNMPV3_AUTH_PROTOCOL:-SHA}"
+V3_AUTH_PASSWORD="${SNMPV3_AUTH_PASSWORD:-}"
+V3_PRIV_PROTOCOL="${SNMPV3_PRIV_PROTOCOL:-AES}"
+V3_PRIV_PASSWORD="${SNMPV3_PRIV_PASSWORD:-}"
+
+TIMEOUT=2
+RETRIES=0
+
+CHECK_STACK=0
+
+HOST_FILE=""
+CONTINUE_ON_ERROR=0
+
+# Colour modes:
+#   auto: enable colour only when stdout is a terminal
+#   yes:  always enable colour
+#   no:   never enable colour
+USE_COLOR="auto"
+
+COLOR_RED=""
+COLOR_GREEN=""
+COLOR_YELLOW=""
+COLOR_CYAN=""
+COLOR_RESET=""
+
+declare -a HOSTS=()
+declare -a SNMP_OPTIONS=()
+
+###############################################################################
+# General functions
+###############################################################################
+
+usage() {
+    cat <<EOF
+Usage:
+  ${PROGRAM_NAME} [options] --hosts HOST [HOST ...]
+  ${PROGRAM_NAME} [options] --host-file FILE
+
+Target options:
+  --hosts HOST [...]           One or more hostnames or IP addresses
+  --host-file FILE             File containing hosts, one per line
+
+SNMP version:
+  -v, --snmp-version VERSION   SNMP version: 2c or 3
+                               Default: 2c
+
+SNMPv2c:
+  -c, --community STRING       SNMP community
+                               Alternatively set SNMP_COMMUNITY
+
+SNMPv3:
+  -u, --v3-user USER           SNMPv3 security name
+  -l, --v3-level LEVEL         noAuthNoPriv, authNoPriv or authPriv
+                               Default: authPriv
+  -a, --auth-protocol PROTO    Authentication protocol
+                               Default: SHA
+  -A, --auth-password PASS     Authentication password
+  -x, --priv-protocol PROTO    Privacy protocol
+                               Default: AES
+  -X, --priv-password PASS     Privacy password
+
+Polling behaviour:
+  -t, --timeout SECONDS        SNMP request timeout
+                               Default: 2
+  -r, --retries COUNT          Number of SNMP retries
+                               Default: 0
+  --continue-on-error          Continue if a target's sysName poll fails
+
+Colour options:
+  --color                      Force ANSI colour output
+  --no-color                   Disable ANSI colour output
+
+  By default, colour is enabled only when stdout is connected to a terminal.
+  Colour is automatically disabled when output is piped or redirected.
+
+Other options:
+  --stack                      Check stackwise member states
+  --sysuptime                  Force sysUpTime for Uptime info
+
+  -h, --help                   Display this help
+
+
+Environment variables:
+  SNMP_COMMUNITY
+  SNMPV3_USER
+  SNMPV3_LEVEL
+  SNMPV3_AUTH_PROTOCOL
+  SNMPV3_AUTH_PASSWORD
+  SNMPV3_PRIV_PROTOCOL
+  SNMPV3_PRIV_PASSWORD
+  NO_COLOR
+
+Host-file format:
+  Blank lines and lines beginning with '#' are ignored.
+  Inline comments are also accepted.
+
+Examples:
+  ${PROGRAM_NAME} -c COMMUNITY \\
+      --hosts host1.lab.local host2.lab.local
+
+  SNMP_COMMUNITY='COMMUNITY' \\
+      ${PROGRAM_NAME} --host-file switches.txt
+
+  ${PROGRAM_NAME} -v 3 \\
+      -u snmp-readonly \\
+      -l authPriv \\
+      -a SHA \\
+      -A 'authentication-password' \\
+      -x AES \\
+      -X 'privacy-password' \\
+      --hosts host1.lab.local
+
+  ${PROGRAM_NAME} -c COMMUNITY \\
+      --no-color \\
+      --host-file switches.txt > results.txt
+EOF
+}
+
+die() {
+    printf 'Error: %s\n' "$*" >&2
+    exit 2
+}
+
+warn() {
+    printf 'Warning: %s\n' "$*" >&2
+}
+
+require_commands() {
+    local command_name
+
+    for command_name in snmpget snmpgetnext snmpwalk head; do
+        command -v "$command_name" >/dev/null 2>&1 ||
+            die "Required command not found: ${command_name}"
+    done
+}
+
+###############################################################################
+# Colour handling
+###############################################################################
+
+setup_colors() {
+    # Honour the NO_COLOR convention unless --color was explicitly supplied.
+    if [[ -n "${NO_COLOR:-}" && "$USE_COLOR" == "auto" ]]; then
+        USE_COLOR="no"
+    fi
+
+    case "$USE_COLOR" in
+        auto)
+            if [[ -t 1 && "${TERM:-dumb}" != "dumb" ]]; then
+                COLOR_RED=$'\033[31m'
+                COLOR_GREEN=$'\033[32m'
+                COLOR_YELLOW=$'\033[33m'
+		COLOR_CYAN=$'\033[36m'
+                COLOR_RESET=$'\033[0m'
+            fi
+            ;;
+
+        yes)
+            COLOR_RED=$'\033[31m'
+            COLOR_GREEN=$'\033[32m'
+            COLOR_YELLOW=$'\033[33m'
+	    COLOR_CYAN=$'\033[36m'
+            COLOR_RESET=$'\033[0m'
+            ;;
+
+        no)
+            COLOR_RED=""
+            COLOR_GREEN=""
+            COLOR_YELLOW=""
+	    COLOR_CYAN=""
+            COLOR_RESET=""
+            ;;
+
+        *)
+            die "Invalid colour mode: ${USE_COLOR}"
+            ;;
+    esac
+}
+
+status_colour() {
+    local status="$1"
+
+    case "$status" in
+        OK*)
+            printf '%s' "$COLOR_GREEN"
+            ;;
+
+        FAIL*|CRITICAL*)
+            printf '%s' "$COLOR_RED"
+            ;;
+
+        *)
+            printf '%s' "$COLOR_YELLOW"
+            ;;
+    esac
+}
+
+###############################################################################
+# Argument handling
+###############################################################################
+
+load_host_file() {
+    local file="$1"
+    local line
+
+    [[ -r "$file" ]] || die "Cannot read host file: ${file}"
+
+    while IFS= read -r line || [[ -n "$line" ]]; do
+        # Remove carriage returns from DOS-format files.
+        line="${line//$'\r'/}"
+
+        # Remove inline comments.
+        line="${line%%#*}"
+
+        # Trim leading whitespace.
+        line="${line#"${line%%[![:space:]]*}"}"
+
+        # Trim trailing whitespace.
+        line="${line%"${line##*[![:space:]]}"}"
+
+        [[ -n "$line" ]] && HOSTS+=("$line")
+    done < "$file"
+}
+
+parse_arguments() {
+    while (($#)); do
+        case "$1" in
+            --hosts)
+                shift
+                (($#)) || die "--hosts requires at least one host"
+
+                while (($#)) && [[ "$1" != -* ]]; do
+                    HOSTS+=("$1")
+                    shift
+                done
+                ;;
+
+            --host-file)
+                (($# >= 2)) || die "--host-file requires a filename"
+                HOST_FILE="$2"
+                shift 2
+                ;;
+
+            -v|--snmp-version)
+                (($# >= 2)) || die "$1 requires a value"
+                SNMP_VERSION="$2"
+                shift 2
+                ;;
+
+            -c|--community)
+                (($# >= 2)) || die "$1 requires a value"
+                COMMUNITY="$2"
+                shift 2
+                ;;
+
+            -u|--v3-user)
+                (($# >= 2)) || die "$1 requires a value"
+                V3_USER="$2"
+                shift 2
+                ;;
+
+            -l|--v3-level)
+                (($# >= 2)) || die "$1 requires a value"
+                V3_LEVEL="$2"
+                shift 2
+                ;;
+
+            -a|--auth-protocol)
+                (($# >= 2)) || die "$1 requires a value"
+                V3_AUTH_PROTOCOL="$2"
+                shift 2
+                ;;
+
+            -A|--auth-password)
+                (($# >= 2)) || die "$1 requires a value"
+                V3_AUTH_PASSWORD="$2"
+                shift 2
+                ;;
+
+            -x|--priv-protocol)
+                (($# >= 2)) || die "$1 requires a value"
+                V3_PRIV_PROTOCOL="$2"
+                shift 2
+                ;;
+
+            -X|--priv-password)
+                (($# >= 2)) || die "$1 requires a value"
+                V3_PRIV_PASSWORD="$2"
+                shift 2
+                ;;
+
+            -t|--timeout)
+                (($# >= 2)) || die "$1 requires a value"
+                TIMEOUT="$2"
+                shift 2
+                ;;
+
+            -r|--retries)
+                (($# >= 2)) || die "$1 requires a value"
+                RETRIES="$2"
+                shift 2
+                ;;
+
+            --sysuptime)
+                UPTIME_SOURCE="sysuptime"
+                shift
+                ;;
+
+            --stack)
+                CHECK_STACK=1
+                shift
+                ;;
+
+            --continue-on-error)
+                CONTINUE_ON_ERROR=1
+                shift
+                ;;
+
+            --color|--colour)
+                USE_COLOR="yes"
+                shift
+                ;;
+
+            --no-color|--no-colour)
+                USE_COLOR="no"
+                shift
+                ;;
+
+            -h|--help)
+                usage
+                exit 0
+                ;;
+
+            --)
+                shift
+
+                while (($#)); do
+                    HOSTS+=("$1")
+                    shift
+                done
+                ;;
+
+            -*)
+                die "Unknown option: $1"
+                ;;
+
+            *)
+                die "Unexpected argument '${1}'. Use --hosts before hostnames."
+                ;;
+        esac
+    done
+}
+
+validate_configuration() {
+    [[ "$TIMEOUT" =~ ^[0-9]+([.][0-9]+)?$ ]] ||
+        die "Timeout must be a positive number"
+
+    [[ "$RETRIES" =~ ^[0-9]+$ ]] ||
+        die "Retries must be zero or a positive integer"
+
+    if [[ -n "$HOST_FILE" ]]; then
+        load_host_file "$HOST_FILE"
+    fi
+
+    ((${#HOSTS[@]} > 0)) ||
+        die "No targets supplied. Use --hosts or --host-file."
+
+    case "$SNMP_VERSION" in
+        2c)
+            [[ -n "$COMMUNITY" ]] ||
+                die "SNMPv2c requires --community or SNMP_COMMUNITY"
+
+            SNMP_OPTIONS=(
+                -v2c
+                -c "$COMMUNITY"
+                -t "$TIMEOUT"
+                -r "$RETRIES"
+            )
+            ;;
+
+        3)
+            [[ -n "$V3_USER" ]] ||
+                die "SNMPv3 requires --v3-user or SNMPV3_USER"
+
+            case "$V3_LEVEL" in
+                noAuthNoPriv)
+                    SNMP_OPTIONS=(
+                        -v3
+                        -u "$V3_USER"
+                        -l noAuthNoPriv
+                        -t "$TIMEOUT"
+                        -r "$RETRIES"
+                    )
+                    ;;
+
+                authNoPriv)
+                    [[ -n "$V3_AUTH_PASSWORD" ]] ||
+                        die "authNoPriv requires an authentication password"
+
+                    SNMP_OPTIONS=(
+                        -v3
+                        -u "$V3_USER"
+                        -l authNoPriv
+                        -a "$V3_AUTH_PROTOCOL"
+                        -A "$V3_AUTH_PASSWORD"
+                        -t "$TIMEOUT"
+                        -r "$RETRIES"
+                    )
+                    ;;
+
+                authPriv)
+                    [[ -n "$V3_AUTH_PASSWORD" ]] ||
+                        die "authPriv requires an authentication password"
+
+                    [[ -n "$V3_PRIV_PASSWORD" ]] ||
+                        die "authPriv requires a privacy password"
+
+                    SNMP_OPTIONS=(
+                        -v3
+                        -u "$V3_USER"
+                        -l authPriv
+                        -a "$V3_AUTH_PROTOCOL"
+                        -A "$V3_AUTH_PASSWORD"
+                        -x "$V3_PRIV_PROTOCOL"
+                        -X "$V3_PRIV_PASSWORD"
+                        -t "$TIMEOUT"
+                        -r "$RETRIES"
+                    )
+                    ;;
+
+                *)
+                    die "Invalid SNMPv3 level: ${V3_LEVEL}"
+                    ;;
+            esac
+            ;;
+
+        *)
+            die "Unsupported SNMP version '${SNMP_VERSION}'. Use 2c or 3."
+            ;;
+    esac
+}
+
+###############################################################################
+# SNMP functions
+###############################################################################
+
+snmp_get() {
+    local target="$1"
+    local oid="$2"
+
+    snmpget \
+        "${SNMP_OPTIONS[@]}" \
+        -Oqv \
+        "$target" \
+        "$oid" \
+        2>/dev/null
+}
+
+snmp_walk() {
+    local target="$1"
+    local oid="$2"
+
+    snmpwalk \
+        "${SNMP_OPTIONS[@]}" \
+        -Oqv \
+        "$target" \
+        "$oid" \
+        2>/dev/null
+}
+
+snmp_getnext_numeric() {
+    local target="$1"
+    local oid="$2"
+
+    snmpgetnext \
+        "${SNMP_OPTIONS[@]}" \
+        -On \
+        "$target" \
+        "$oid" \
+        2>/dev/null
+}
+
+snmp_walk_numeric() {
+    local target="$1"
+    local oid="$2"
+
+    # -Oe prevents locally installed MIBs from translating integer enums
+    # into textual labels. This ensures consistent status processing.
+    snmpwalk \
+        "${SNMP_OPTIONS[@]}" \
+        -Oqv \
+        -Oe \
+        "$target" \
+        "$oid" \
+        2>/dev/null
+}
+
+###############################################################################
+# General value processing
+###############################################################################
+
+clean_value() {
+    local value="$1"
+
+    value="${value//$'\r'/}"
+    value="${value//$'\n'/ }"
+
+    # Trim leading whitespace.
+    value="${value#"${value%%[![:space:]]*}"}"
+
+    # Trim trailing whitespace.
+    value="${value%"${value##*[![:space:]]}"}"
+
+    # Remove one surrounding pair of double quotes.
+    if [[ "$value" == \"*\" ]]; then
+        value="${value#\"}"
+        value="${value%\"}"
+    fi
+
+    printf '%s' "$value"
+}
+
+is_invalid_snmp_value() {
+    local value="$1"
+
+    [[ -z "$value" ]] ||
+    [[ "$value" == *"No Such Object"* ]] ||
+    [[ "$value" == *"No Such Instance"* ]] ||
+    [[ "$value" == *"No more variables"* ]] ||
+    [[ "$value" == *"Timeout"* ]]
+}
+
+extract_integer() {
+    local value="$1"
+
+    # Handles forms such as:
+    #   2
+    #   on(2)
+    #   INTEGER: 2
+    if [[ "$value" =~ \(([0-9]+)\) ]]; then
+        printf '%s' "${BASH_REMATCH[1]}"
+    elif [[ "$value" =~ ^[[:space:]]*([0-9]+)[[:space:]]*$ ]]; then
+        printf '%s' "${BASH_REMATCH[1]}"
+    elif [[ "$value" =~ ([0-9]+) ]]; then
+        printf '%s' "${BASH_REMATCH[1]}"
+    fi
+}
+
+###############################################################################
+# Uptime processing
+###############################################################################
+
+normalise_uptime() {
+    local uptime="$1"
+    local days=0
+    local hours=0
+    local minutes=0
+
+    uptime="$(clean_value "$uptime")"
+
+    #
+    # Net-SNMP format:
+    #   24:23:20:17.66
+    #   days:hours:minutes:seconds
+    #
+    if [[ "$uptime" =~ ^([0-9]+):([0-9]+):([0-9]+):([0-9]+) ]]; then
+        days=$((10#${BASH_REMATCH[1]}))
+        hours=$((10#${BASH_REMATCH[2]}))
+        minutes=$((10#${BASH_REMATCH[3]}))
+
+        printf '%dd,%02d:%02d' \
+            "$days" \
+            "$hours" \
+            "$minutes"
+        return
+    fi
+
+    #
+    # Traditional Net-SNMP format:
+    #   24 days, 23:20:17
+    #
+    if [[ "$uptime" =~ ([0-9]+)[[:space:]]+days?,[[:space:]]*([0-9]{1,2}):([0-9]{2}):([0-9]{2}) ]]; then
+        days=$((10#${BASH_REMATCH[1]}))
+        hours=$((10#${BASH_REMATCH[2]}))
+        minutes=$((10#${BASH_REMATCH[3]}))
+
+        printf '%dd,%02d:%02d' \
+            "$days" \
+            "$hours" \
+            "$minutes"
+        return
+    fi
+
+    #
+    # Less than one day:
+    #   23:20:17
+    #
+    if [[ "$uptime" =~ ^([0-9]{1,2}):([0-9]{2}):([0-9]{2}) ]]; then
+        hours=$((10#${BASH_REMATCH[1]}))
+        minutes=$((10#${BASH_REMATCH[2]}))
+
+        printf '0d,%02d:%02d' \
+            "$hours" \
+            "$minutes"
+        return
+    fi
+
+    printf 'Unknown'
+}
+
+normalise_engine_time() {
+    local raw="$1"
+    local seconds
+    local days
+    local hours
+    local minutes
+
+    raw="$(clean_value "$raw")"
+
+    if is_invalid_snmp_value "$raw"; then
+        return 1
+    fi
+
+    #
+    # snmpEngineTime is an INTEGER expressed in seconds.
+    #
+    # With -Oqv this will normally just be:
+    #
+    #   1234567
+    #
+    seconds="$(extract_integer "$raw")"
+
+    [[ -n "$seconds" ]] || return 1
+
+    seconds=$((10#$seconds))
+
+    days=$((seconds / 86400))
+    hours=$(((seconds % 86400) / 3600))
+    minutes=$(((seconds % 3600) / 60))
+
+    printf '%dd,%02d:%02d' \
+        "$days" \
+        "$hours" \
+        "$minutes"
+}
+
+###############################################################################
+# Software version processing
+###############################################################################
+
+normalise_software_version() {
+    local description="$1"
+    local version=""
+
+    description="$(clean_value "$description")"
+
+    if [[ "$description" =~ [Vv]ersion[[:space:]]+([^,[:space:]]+) ]]; then
+        version="${BASH_REMATCH[1]}"
+    fi
+
+    [[ -z "$version" ]] && {
+        printf 'Unknown'
+        return
+    }
+
+    case "$description" in
+        *IOSXE*|*"IOS XE"*|*"IOS-XE"*)
+            printf 'IOSXE-%s' "$version"
+            ;;
+
+        *NX-OS*|*NXOS*|*"Cisco Nexus"*)
+            printf 'NXOS-%s' "$version"
+            ;;
+
+        *"Cisco IOS Software"*)
+            printf 'IOS-%s' "$version"
+            ;;
+
+        *)
+            printf '%s' "$version"
+            ;;
+    esac
+}
+
+###############################################################################
+# PSU processing
+###############################################################################
+
+psu_state_name() {
+    case "$1" in
+        1) printf 'offEnvOther' ;;
+        2) printf 'on' ;;
+        3) printf 'offAdmin' ;;
+        4) printf 'offDenied' ;;
+        5) printf 'offEnvPower' ;;
+        6) printf 'offEnvTemp' ;;
+        7) printf 'offEnvFan' ;;
+        *) printf 'unknown(%s)' "$1" ;;
+    esac
+}
+
+envmon_psu_state_name() {
+    case "$1" in
+        1) printf 'normal' ;;
+        2) printf 'warning' ;;
+        3) printf 'critical' ;;
+        4) printf 'shutdown' ;;
+        5) printf 'notPresent' ;;
+        6) printf 'notFunctioning' ;;
+        *) printf 'unknown(%s)' "$1" ;;
+    esac
+}
+
+summarise_primary_psus() {
+    local raw="$1"
+    local line
+    local state
+    local total=0
+    local healthy=0
+    local -a problems=()
+
+    while IFS= read -r line; do
+        is_invalid_snmp_value "$line" && continue
+
+        state="$(extract_integer "$line")"
+        [[ -n "$state" ]] || continue
+
+        ((total++))
+
+        if [[ "$state" == "2" ]]; then
+            ((healthy++))
+        else
+            problems+=("$(psu_state_name "$state")")
+        fi
+    done <<< "$raw"
+
+    if ((total == 0)); then
+        return 1
+    fi
+
+    if ((${#problems[@]} == 0)); then
+        printf 'OK (%d/%d)' "$healthy" "$total"
+    else
+        local problem_list
+        problem_list="$(
+            IFS=,
+            printf '%s' "${problems[*]}"
+        )"
+
+        printf 'FAIL %s' "$problem_list"
+    fi
+}
+
+summarise_envmon_psus() {
+    local raw="$1"
+    local line
+    local state
+    local total=0
+    local healthy=0
+    local -a problems=()
+
+    while IFS= read -r line; do
+        is_invalid_snmp_value "$line" && continue
+
+        state="$(extract_integer "$line")"
+        [[ -n "$state" ]] || continue
+
+        ((total++))
+
+        if [[ "$state" == "1" ]]; then
+            ((healthy++))
+        else
+            problems+=("$(envmon_psu_state_name "$state")")
+        fi
+    done <<< "$raw"
+
+    if ((total == 0)); then
+        return 1
+    fi
+
+    if ((${#problems[@]} == 0)); then
+        printf 'OK (%d/%d)' "$healthy" "$total"
+    else
+        local problem_list
+        problem_list="$(
+            IFS=,
+            printf '%s' "${problems[*]}"
+        )"
+
+        printf 'FAIL %s' "$problem_list"
+    fi
+}
+
+get_psu_status() {
+    local target="$1"
+    local raw
+    local status
+
+    raw="$(
+        snmp_walk_numeric \
+            "$target" \
+            "$OID_CEFC_PSU_STATUS" ||
+            true
+    )"
+
+    if status="$(summarise_primary_psus "$raw")"; then
+        printf '%s' "$status"
+        return
+    fi
+
+    raw="$(
+        snmp_walk_numeric \
+            "$target" \
+            "$OID_ENVMON_PSU_STATUS" ||
+            true
+    )"
+
+    if status="$(summarise_envmon_psus "$raw")"; then
+        printf '%s' "$status"
+    else
+        printf 'Unsupported'
+    fi
+}
+
+###############################################################################
+# Fan processing
+###############################################################################
+
+fan_state_name() {
+    case "$1" in
+        1) printf 'unknown' ;;
+        2) printf 'up' ;;
+        3) printf 'down' ;;
+        4) printf 'warning' ;;
+        *) printf 'unknown(%s)' "$1" ;;
+    esac
+}
+
+get_fan_status() {
+    local target="$1"
+    local raw
+    local line
+    local state
+    local total=0
+    local healthy=0
+    local -a problems=()
+
+    raw="$(
+        snmp_walk_numeric \
+            "$target" \
+            "$OID_CEFC_FAN_STATUS" ||
+            true
+    )"
+
+    while IFS= read -r line; do
+        is_invalid_snmp_value "$line" && continue
+
+        state="$(extract_integer "$line")"
+        [[ -n "$state" ]] || continue
+
+        ((total++))
+
+        if [[ "$state" == "2" ]]; then
+            ((healthy++))
+        else
+            problems+=("$(fan_state_name "$state")")
+        fi
+    done <<< "$raw"
+
+    if ((total == 0)); then
+        printf 'Unsupported'
+    elif ((${#problems[@]} == 0)); then
+        printf 'OK (%d/%d)' "$healthy" "$total"
+    else
+        local problem_list
+        problem_list="$(
+            IFS=,
+            printf '%s' "${problems[*]}"
+        )"
+
+        printf 'FAIL %s' "$problem_list"
+    fi
+}
+
+###############################################################################
+# Serial number processing
+###############################################################################
+
+find_chassis_index() {
+    local target="$1"
+    local current_oid="$OID_ENT_PHYSICAL_CLASS"
+    local raw
+    local returned_oid
+    local value
+    local index
+    local count
+
+    for ((count = 0; count < 50; count++)); do
+
+        raw="$(snmp_getnext_numeric "$target" "$current_oid")" ||
+            return 1
+
+        [[ -n "$raw" ]] || return 1
+
+        returned_oid="${raw%% *}"
+
+        #
+        # Stop if GETNEXT has moved beyond entPhysicalClass.
+        #
+        if [[ "$returned_oid" != "${OID_ENT_PHYSICAL_CLASS}."* ]]; then
+            return 1
+        fi
+
+        #
+        # snmpgetnext -On returns:
+        #
+        # .1.3...1.5.149 = INTEGER: 3
+        #
+        if [[ "$raw" =~ INTEGER:[[:space:]]*([0-9]+) ]]; then
+            value="${BASH_REMATCH[1]}"
+        else
+            return 1
+        fi
+
+        #
+        # ENTITY-MIB entPhysicalClass chassis(3)
+        #
+        if [[ "$value" == "3" ]]; then
+            index="${returned_oid##*.}"
+
+            [[ "$index" =~ ^[0-9]+$ ]] || return 1
+
+            printf '%s' "$index"
+            return 0
+        fi
+
+        current_oid="$returned_oid"
+    done
+
+    return 1
+}
+
+get_chassis_serial_fast() {
+    local target="$1"
+    local index
+    local serial
+
+    index="$(find_chassis_index "$target")" || return 1
+
+    serial="$(
+        snmp_get "$target" \
+            "${OID_ENT_PHYSICAL_SERIAL}.${index}" 2>/dev/null
+    )" || return 1
+
+    serial="$(clean_value "$serial")"
+
+    if is_invalid_snmp_value "$serial"; then
+        return 1
+    fi
+
+    [[ -n "$serial" ]] || return 1
+
+    printf '%s' "$serial"
+}
+
+get_serial_slow() {
+
+    local target="$1"
+    local serial
+
+    #
+    # ENTITY-MIB serial table
+    #
+    serial="$(
+        snmp_walk "$target" "$OID_ENTITY_SERIAL" |
+        grep -v '^""$' |
+        grep -v '^$' |
+        head -n 1 ||
+        true
+    )"
+
+    serial="$(clean_value "$serial")"
+
+    if [[ -n "$serial" ]] &&
+       ! is_invalid_snmp_value "$serial"
+    then
+        printf '%s' "$serial"
+    else
+        printf 'Unknown'
+    fi
+}
+
+
+get_serial() {
+    local target="$1"
+    local serial
+
+    #
+    # Fast path:
+    # locate chassis with bounded GETNEXT operations,
+    # then directly GET its serial number.
+    #
+    if serial="$(get_chassis_serial_fast "$target")"; then
+        printf '%s' "$serial"
+        return 0
+    fi
+
+    #
+    # Compatibility fallback.
+    #
+    get_serial_slow "$target"
+}
+
+###############################################################################
+# Stack Processing
+###############################################################################
+
+get_stack_status() {
+    local target="$1"
+    local raw
+    local line
+    local state
+    local total=0
+    local active=0
+
+    raw="$(
+        snmp_walk_numeric \
+            "$target" \
+            "$OID_STACK_MEMBER_STATE" ||
+        true
+    )"
+
+    while IFS= read -r line; do
+        is_invalid_snmp_value "$line" && continue
+
+        state="$(extract_integer "$line")"
+        [[ -n "$state" ]] || continue
+
+        ((total++))
+
+        #
+        # Stack member state 4 = ready
+        #
+        if [[ "$state" == "4" ]]; then
+            ((active++))
+        fi
+
+    done <<< "$raw"
+
+    if ((total == 0)); then
+        printf '[-]'
+    else
+        printf '[%d/%d]' "$active" "$total"
+    fi
+}
+
+###############################################################################
+# Table output
+###############################################################################
+
+clip() {
+    local value="$1"
+    local width="$2"
+
+    if ((${#value} > width)); then
+        printf '%.*s~' "$((width - 1))" "$value"
+    else
+        printf '%s' "$value"
+    fi
+}
+
+print_header() {
+    printf '%-28s %-28s %-16s %-16s %-22s %-22s' \
+        "TARGET" \
+        "SYSNAME" \
+        "SERIAL" \
+        "UPTIME" \
+        "PSU STATUS" \
+        "FAN STATUS"
+
+    if ((CHECK_STACK)); then
+        printf ' %-9s' "STACK"
+    fi
+
+    printf ' %-18s\n' "SOFTWARE"
+
+    printf '%-28s %-28s %-16s %-16s %-22s %-22s' \
+        "----------------------------" \
+        "----------------------------" \
+        "----------------" \
+        "----------------" \
+        "----------------------" \
+        "----------------------"
+
+    if ((CHECK_STACK)); then
+        printf ' %-9s' "---------"
+    fi
+
+    printf ' %-18s\n' "------------------"
+}
+
+print_status_field() {
+    local value="$1"
+    local width="$2"
+    local display_value
+    local colour
+
+    display_value="$(clip "$value" "$width")"
+    colour="$(status_colour "$value")"
+
+    # Padding is applied inside the colour sequence so ANSI escape characters
+    # do not affect the visual width of the table.
+    printf '%s%-*s%s' \
+        "$colour" \
+        "$width" \
+        "$display_value" \
+        "$COLOR_RESET"
+}
+
+print_uptime_source() {
+    if [[ "$UPTIME_SOURCE" == "sysuptime" ]]; then
+        printf 'Uptime source: sysUpTime (forced)\n'
+    else
+        printf 'Uptime source: snmpEngineTime (sysUpTime fallback)\n'
+    fi
+}
+
+print_uptime_field() {
+    local value="$1"
+    local width="$2"
+    local display_value
+    local colour="$COLOR_YELLOW"
+    local days=0
+    local hours=0
+
+    display_value="$(clip "$value" "$width")"
+
+    #
+    # Expected format:
+    #   0d,00:37
+    #   0d,12:45
+    #   3d,04:22
+    #   24d,23:20
+    #
+    if [[ "$value" =~ ^([0-9]+)d,([0-9]{2}):([0-9]{2})$ ]]; then
+        days=$((10#${BASH_REMATCH[1]}))
+        hours=$((10#${BASH_REMATCH[2]}))
+
+        if ((days >= 7)); then
+            colour="$COLOR_GREEN"
+
+        elif ((days >= 1)); then
+            colour="$COLOR_CYAN"
+
+        elif ((hours >= 1)); then
+            colour="$COLOR_YELLOW"
+
+        else
+            colour="$COLOR_RED"
+        fi
+    fi
+
+    printf '%s%-*s%s' \
+        "$colour" \
+        "$width" \
+        "$display_value" \
+        "$COLOR_RESET"
+}
+
+print_stack_field() {
+    local value="$1"
+    local width="$2"
+    local active
+    local total
+    local colour=""
+
+    if [[ "$value" =~ ^\[([0-9]+)/([0-9]+)\]$ ]]; then
+        active=$((10#${BASH_REMATCH[1]}))
+        total=$((10#${BASH_REMATCH[2]}))
+
+        if ((total > 0 && active == total)); then
+            colour="$COLOR_GREEN"
+        else
+            colour="$COLOR_YELLOW"
+        fi
+    fi
+
+    printf '%s%-*s%s' \
+        "$colour" \
+        "$width" \
+        "$(clip "$value" "$width")" \
+        "$COLOR_RESET"
+}
+
+print_row() {
+    local target="$1"
+    local sysname="$2"
+    local serial="$3"
+    local uptime="$4"
+    local psu="$5"
+    local fan="$6"
+    local stack="$7"
+    local software="$8"
+
+    printf '%-28s %-28s %-16s ' \
+        "$(clip "$target" 28)" \
+        "$(clip "$sysname" 28)" \
+        "$(clip "$serial" 16)"
+
+    print_uptime_field "$uptime" 16
+    printf ' '
+
+    print_status_field "$psu" 22
+    printf ' '
+
+    print_status_field "$fan" 22
+
+    if ((CHECK_STACK)); then
+        printf ' '
+        print_stack_field "$stack" 9
+    fi
+
+    printf ' '
+
+    printf '%-18s\n' "$(clip "$software" 18)"
+}
+
+print_failed_row() {
+    local target="$1"
+
+    printf '%-28s %-28s %-16s %-16s ' \
+        "$(clip "$target" 28)" \
+        "$(clip "SNMP FAILED" 28)" \
+        "-" \
+        "-"
+
+    printf '%s%-22s%s ' \
+        "$COLOR_RED" \
+        "-" \
+        "$COLOR_RESET"
+
+    printf '%s%-22s%s ' \
+        "$COLOR_RED" \
+        "-" \
+        "$COLOR_RESET"
+
+    if ((CHECK_STACK)); then
+        printf ' %-9s' "-"
+    fi
+    
+    printf '%-18s\n' "-"
+}
+
+###############################################################################
+# Target polling
+###############################################################################
+
+get_uptime() {
+    local target="$1"
+    local raw
+    local uptime
+
+    #
+    # Default behaviour:
+    #
+    #   1. Try snmpEngineTime
+    #   2. Fall back to sysUpTime
+    #
+    if [[ "$UPTIME_SOURCE" != "sysuptime" ]]; then
+
+        raw="$(
+            snmp_get "$target" "$OID_SNMP_ENGINE_TIME" ||
+            true
+        )"
+
+        if uptime="$(normalise_engine_time "$raw")"; then
+            printf '%s' "$uptime"
+            return 0
+        fi
+    fi
+
+    #
+    # sysUpTime fallback, or explicitly selected with --sysuptime.
+    #
+    raw="$(
+        snmp_get "$target" "$OID_SYS_UPTIME" ||
+        true
+    )"
+
+    if is_invalid_snmp_value "$raw"; then
+        printf 'Unknown'
+        return 1
+    fi
+
+    normalise_uptime "$raw"
+}
+
+
+poll_target() {
+    local target="$1"
+    local sysname
+    local serial
+    local uptime
+    local psu
+    local fan
+    local description
+    local software
+    local stack="N/A"
+
+    # Gatekeeper poll. Do not attempt other OIDs if sysName fails.
+    if ! sysname="$(snmp_get "$target" "$OID_SYS_NAME")"; then
+        return 1
+    fi
+
+    sysname="$(clean_value "$sysname")"
+
+    if is_invalid_snmp_value "$sysname"; then
+        return 1
+    fi
+
+    serial="$(get_serial "$target")"
+
+    uptime="$(
+        get_uptime "$target" ||
+        true
+    )"
+
+    psu="$(get_psu_status "$target")"
+    fan="$(get_fan_status "$target")"
+    if ((CHECK_STACK)); then
+        stack="$(get_stack_status "$target")"
+    fi
+
+    description="$(
+        snmp_get "$target" "$OID_SYS_DESCR" ||
+            true
+    )"
+    software="$(normalise_software_version "$description")"
+
+    print_row \
+        "$target" \
+        "$sysname" \
+        "$serial" \
+        "$uptime" \
+        "$psu" \
+        "$fan" \
+        "$stack" \
+        "$software"
+}
+
+###############################################################################
+# Main
+###############################################################################
+
+main() {
+    local target
+    local failures=0
+
+    parse_arguments "$@"
+    require_commands
+    validate_configuration
+    setup_colors
+    print_uptime_source
+    print_header
+
+    for target in "${HOSTS[@]}"; do
+        if ! poll_target "$target"; then
+            warn "${target}: sysName poll failed"
+
+            if ((CONTINUE_ON_ERROR)); then
+                print_failed_row "$target"
+                ((failures++))
+            else
+                printf '\nAborting: the initial sysName poll failed for %s.\n' \
+                    "$target" >&2
+                exit 1
+            fi
+        fi
+    done
+
+    if ((failures > 0)); then
+        return 1
+    fi
+
+    return 0
+}
+
+main "$@"
