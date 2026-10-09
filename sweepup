@@ -1,11 +1,11 @@
 #!/bin/bash
 #
-# Sweep devices for uptime to look for reboots or general uptime audit.
+# Sweep devices for uptime.
 # v2.2 - Unified DHMS formatting (via -Ot), SNMPCMD as array, clearer SNMP error highlighting
 #
 # use -f to specify input file of specific hostnames/FQDNs or IPs to poll
 # use -l to specify a list of specific hostnames or IPs on the command line
-# use -v3 to specify SNMPv3 (creds set below as they are a pain to type out)
+# use -v3 to specify SNMPv3
 # use -c to override the v2c community string
 # use -s to check status of stackwise members
 # use -e to use sysUpTime instead of snmpEngineTime
@@ -37,16 +37,15 @@ Examples:
   $0 -l router{1..8}.lab.local
 
 "
-
 TIMEOUT=4		# 4 secs
 RETRIES=0		# No retries
 READSTR="public"	# v2c community
 FILE=/etc/hosts		# Default file to search for resolution
-V3USER="snmp-v3-user"	# Default SNMPV3 User
+V3USER=v3user		# Default SNMPV3 User
 V3AUTH=SHA		# Default SNMPV3 Auth Mechanism
-SNMPAUTH="V3AuthPW"	# SNMPv3 Auth Password
+SNMPAUTH="SNMPAUTHPWD"	# SNMPv3 Auth Password
 V3PRIV=AES		# Default SNMPV3 Priv Mechanism
-SNMPPRIV="V3PrivPW"	# SNMPv3 Priv Password
+SNMPPRIV="SNMPPRIVPWD"	# SNMPv3 Priv Password
 SNMPVER=2c		# Default version = 2c
 USEENGINE=1		# Use snmpEngineTime - sysUpTime wraps after 496 days
 STACKSTATEOID=1.3.6.1.4.1.9.9.500.1.2.1.1.6
@@ -156,6 +155,11 @@ while [ "$#" -gt 0 ]; do
    esac
 done
 
+# Stack state is a table column, so it needs snmpwalk rather than snmpget.
+# Derive the walk command from SNMPCMD so -c / -v3 settings carry over.
+SNMPWALK=("${SNMPCMD[@]}")
+SNMPWALK[0]=snmpwalk
+
 # If neither -l nor -f gave us a list, search $FILE for a pattern match
 if [ "${#LIST[@]}" -eq 0 ]; then
    if [ -z "$PATTERN" ]; then
@@ -188,22 +192,22 @@ for host in "${LIST[@]}"
 
     # If requested, check for stackwise switches being up
     if [ "$STACKS" == "1" ] ; then
-       SWSUP=$("${SNMPCMD[@]}" "$host" "$STACKSTATEOID" 2>/dev/null |\
-              awk 'BEGIN{ORS="\n";members=0;membok=0}
-              NF ~/^[0-9]$/ {members++ ; swid=substr($1, length($1)-3)} ;
-              NF == 4 { membok++ ;next }
-              END { if ( membok == members && members > 0 ) printf  "\033[32;1m"membok"/"members"\033[0m"
-                    else if ( membok < members )printf "\033[31;1m"membok"/"members"\033[0m"
+       # -Oqve: values only, enums as numbers. cswSwitchState 4 = ready.
+       SWSUP=$("${SNMPWALK[@]}" -Oqve "$host" "$STACKSTATEOID" 2>/dev/null |\
+              awk 'BEGIN{members=0;membok=0}
+              $1 ~ /^[0-9]+$/ { members++ ; if ($1 == 4) membok++ }
+              END { if ( members > 0 && membok == members ) printf "\033[32;1m"membok"/"members"\033[0m"
+                    else if ( members > 0 ) printf "\033[31;1m"membok"/"members"\033[0m"
                     else printf "\033[37mN/A\033[0m"}')
        printf " [$SWSUP] "
     fi
 
     if [ "$USEENGINE" -eq "1" ]; then
        # snmpEngineTime is INTEGER seconds - not affected by -Ot, no scaling needed
-       UPTIME=$("${SNMPCMD[@]}" "$host" .1.3.6.1.6.3.10.2.1.3.0 2>&1 | head -1 | sed 's/^\..*: //g' | awk -v scale=1 "$DHMS_AWK")
+       UPTIME=$("${SNMPCMD[@]}" "$host" .1.3.6.1.6.3.10.2.1.3.0 2>&1 | head -1 | cut -d":" -f2- | awk -v scale=1 "$DHMS_AWK")
     else
        # sysUpTime is TimeTicks centiseconds - -Ot forces raw output, scale down by 100
-       UPTIME=$("${SNMPCMD[@]}" "$host" 1.3.6.1.2.1.1.3.0 2>&1 | head -1 | sed 's/^\..*= //g' | awk -v scale=100 "$DHMS_AWK")
+       UPTIME=$("${SNMPCMD[@]}" "$host" 1.3.6.1.2.1.1.3.0 2>&1 | head -1 | cut -d":" -f2- | awk -v scale=100 "$DHMS_AWK")
     fi
     # awk program to format based upon response or uptime
     echo "$UPTIME" |  awk '$2 ~/^[0-9]+$/ && $2 == 0 {print "\033[31;1m"$0"\033[0m"; exit}
